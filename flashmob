@@ -1,0 +1,714 @@
+#!/usr/bin/env bash
+# flashmob v4: Intelligent QA swarm with advanced features
+# Usage: flashmob [options] [directories...]
+#
+# Options:
+#   -n NUM              Number of agents (default: 3)
+#   -k NUM              Files per agent (default: 4)
+#   -m MODE             Mode: random|clustered|coverage (default: coverage)
+#   -s, --specialized   Use specialized agents (security/perf/correctness)
+#   -x, --cross-validate  Cross-validate with multiple agents per file
+#   --create-beads      Create beads from confirmed issues
+#   --bead-threshold    Minimum severity for beads (default: medium)
+#   --no-line-correct   Skip line number correction
+#   --no-triage         Skip triage validation phase
+#   --no-stream         Disable streaming output (wait for all agents)
+#   --history FILE      History file (default: .flashmob-history)
+#   --no-history        Don't track or use history
+#   --extensions EXT    File extensions to include (default: ss)
+#   --dry-run           Show file assignments without running
+#
+# Modes:
+#   random    - Random sampling
+#   clustered - Group files by directory
+#   coverage  - Prioritize files not recently reviewed
+#
+# Special Modes:
+#   --specialized    - Run 3 focused agents: security, performance, correctness
+#   --cross-validate - All agents review same files, report consensus only
+
+set -euo pipefail
+
+# Defaults
+num_agents=3
+files_per_agent=4
+mode="coverage"
+history_file=".flashmob-history"
+use_history=true
+do_triage=true
+do_line_correct=true
+do_stream=true
+do_create_beads=false
+bead_threshold="medium"
+specialized=false
+cross_validate=false
+dry_run=false
+extensions="ss"
+
+# Parse options
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -n) num_agents="$2"; shift 2 ;;
+        -k) files_per_agent="$2"; shift 2 ;;
+        -m) mode="$2"; shift 2 ;;
+        -s|--specialized) specialized=true; shift ;;
+        -x|--cross-validate) cross_validate=true; shift ;;
+        --create-beads) do_create_beads=true; shift ;;
+        --bead-threshold) bead_threshold="$2"; shift 2 ;;
+        --no-line-correct) do_line_correct=false; shift ;;
+        --no-triage) do_triage=false; shift ;;
+        --no-stream) do_stream=false; shift ;;
+        --history) history_file="$2"; shift 2 ;;
+        --no-history) use_history=false; shift ;;
+        --extensions) extensions="$2"; shift 2 ;;
+        --dry-run) dry_run=true; shift ;;
+        -h|--help)
+            head -30 "$0" | tail -28
+            exit 0
+            ;;
+        -*) echo "Unknown option: $1"; exit 1 ;;
+        *) break ;;
+    esac
+done
+
+dirs=("$@")
+[[ ${#dirs[@]} -eq 0 ]] && dirs=(".")
+
+# Build find pattern for extensions
+ext_pattern=""
+IFS=',' read -ra EXT_ARR <<< "$extensions"
+for ext in "${EXT_ARR[@]}"; do
+    [[ -n "$ext_pattern" ]] && ext_pattern+=" -o "
+    ext_pattern+="-name \"*.$ext\""
+done
+
+# Find all candidate files
+all_files=$(eval "find ${dirs[*]} -type f \( $ext_pattern \)" 2>/dev/null | grep -v '/\.' | sort)
+total_files=$(echo "$all_files" | wc -l)
+
+# Adjust for special modes
+if [[ "$specialized" == true ]]; then
+    num_agents=3  # Always 3: security, performance, correctness
+    echo "🎆 flashmob v4 - Specialized QA Swarm"
+elif [[ "$cross_validate" == true ]]; then
+    echo "🎆 flashmob v4 - Cross-Validation Mode"
+else
+    echo "🎆 flashmob v4 - Intelligent QA Swarm"
+fi
+
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "📁 Directories: ${dirs[*]}"
+echo "📄 Found $total_files candidate files"
+if [[ "$specialized" == true ]]; then
+    echo "🤖 Agents: security + performance + correctness"
+elif [[ "$cross_validate" == true ]]; then
+    echo "🤖 Agents: $num_agents reviewing same $files_per_agent files"
+else
+    echo "🤖 Agents: $num_agents × $files_per_agent files = $((num_agents * files_per_agent)) reviews"
+fi
+echo "🎯 Mode: $mode"
+echo "🔍 Triage: $do_triage"
+[[ "$do_create_beads" == true ]] && echo "📋 Beads: enabled (threshold: $bead_threshold)"
+echo ""
+
+# Load history if enabled
+reviewed_files=""
+if [[ "$use_history" == true && -f "$history_file" ]]; then
+    reviewed_files=$(cat "$history_file" | sort -u)
+    reviewed_count=$(echo "$reviewed_files" | grep -c . || echo 0)
+    echo "📜 History: $reviewed_count files previously reviewed"
+fi
+
+# Select files based on mode
+select_files() {
+    local needed=$1
+    case $mode in
+        random)
+            echo "$all_files" | shuf | head -n "$needed"
+            ;;
+        coverage)
+            if [[ -n "$reviewed_files" ]]; then
+                unreviewed=$(comm -23 <(echo "$all_files" | sort) <(echo "$reviewed_files" | sort))
+                unreviewed_count=$(echo "$unreviewed" | grep -c . || echo 0)
+                if [[ $unreviewed_count -ge $needed ]]; then
+                    echo "$unreviewed" | shuf | head -n "$needed"
+                else
+                    echo "$unreviewed"
+                    remaining=$((needed - unreviewed_count))
+                    echo "$all_files" | shuf | head -n "$remaining"
+                fi
+            else
+                echo "$all_files" | shuf | head -n "$needed"
+            fi
+            ;;
+        clustered)
+            declare -A clusters
+            while IFS= read -r f; do
+                dir=$(dirname "$f")
+                clusters["$dir"]+="$f"$'\n'
+            done <<< "$all_files"
+            for dir in $(echo "${!clusters[@]}" | tr ' ' '\n' | shuf); do
+                echo -n "${clusters[$dir]}"
+            done | head -n "$needed"
+            ;;
+    esac
+}
+
+# Get files and partition for agents
+if [[ "$specialized" == true ]]; then
+    # Specialized mode: each agent reviews ALL target files
+    total_needed=$total_files
+elif [[ "$cross_validate" == true ]]; then
+    # Cross-validate: all agents get same files
+    total_needed=$files_per_agent
+else
+    total_needed=$((num_agents * files_per_agent))
+fi
+
+selected_files=$(select_files "$total_needed")
+selected_count=$(echo "$selected_files" | grep -c . || echo 0)
+
+if [[ $selected_count -lt $total_needed ]]; then
+    echo "⚠️  Only $selected_count files available (requested $total_needed)"
+    if [[ "$cross_validate" != true ]]; then
+        files_per_agent=$((selected_count / num_agents))
+        [[ $files_per_agent -lt 1 ]] && files_per_agent=1
+    fi
+fi
+
+# Build file array
+file_array=()
+while IFS= read -r f; do
+    [[ -n "$f" ]] && file_array+=("$f")
+done <<< "$selected_files"
+
+# Partition files into agent assignments
+declare -a agent_files
+declare -a agent_ids
+declare -a agent_types
+
+if [[ "$specialized" == true ]]; then
+    # Specialized mode: each agent gets ALL files with different focus
+    agent_types=("security" "performance" "correctness")
+    for ((i=0; i<3; i++)); do
+        agent_ids[$i]="agent-${agent_types[$i]}"
+        agent_files[$i]=$(IFS=,; echo "${file_array[*]}")
+    done
+elif [[ "$cross_validate" == true ]]; then
+    # Cross-validate: each agent gets SAME files
+    all_files_csv=$(IFS=,; echo "${file_array[*]}")
+    for ((i=0; i<num_agents; i++)); do
+        agent_ids[$i]=$(printf "agent-%04x" $((RANDOM)))
+        agent_files[$i]="$all_files_csv"
+        agent_types[$i]="general"
+    done
+else
+    # Normal mode: partition files across agents
+    for ((i=0; i<num_agents; i++)); do
+        start=$((i * files_per_agent))
+        agent_files[$i]=""
+        agent_ids[$i]=$(printf "agent-%04x" $((RANDOM)))
+        agent_types[$i]="general"
+        for ((j=0; j<files_per_agent; j++)); do
+            idx=$((start + j))
+            if [[ $idx -lt ${#file_array[@]} ]]; then
+                [[ -n "${agent_files[$i]}" ]] && agent_files[$i]+=","
+                agent_files[$i]+="${file_array[$idx]}"
+            fi
+        done
+    done
+fi
+
+# Show assignments
+echo "📋 File Assignments:"
+for ((i=0; i<${#agent_ids[@]}; i++)); do
+    file_count=$(echo "${agent_files[$i]}" | tr ',' '\n' | grep -c . || echo 0)
+    if [[ "$specialized" == true ]]; then
+        echo "   ${agent_ids[$i]}: $file_count files (${agent_types[$i]} focus)"
+    else
+        echo "   ${agent_ids[$i]}: $file_count files"
+    fi
+    echo "${agent_files[$i]}" | tr ',' '\n' | sed 's/^/      /'
+done
+echo ""
+
+if [[ "$dry_run" == true ]]; then
+    echo "🔍 Dry run - not executing"
+    exit 0
+fi
+
+# Create reports directory
+mkdir -p reports
+rm -f reports/*.shown 2>/dev/null || true
+
+# ============================================================
+# IMPROVED PROMPTS
+# ============================================================
+
+# Base QA instructions with better prompting
+base_qa_instructions='
+QUALITY REQUIREMENTS:
+1. For each issue, you MUST include:
+   - code_snippet: The exact problematic code (3-5 lines)
+   - suggested_fix: How to fix it
+   - confidence: Your confidence level (0.0-1.0)
+   - category: security|performance|correctness|style
+
+2. Confidence levels:
+   - 0.9+: Definitely a bug, you can demonstrate specific failure
+   - 0.7-0.9: Likely a bug, may depend on usage context
+   - 0.5-0.7: Possible issue, needs human review
+   - Below 0.5: Do NOT report
+
+3. DO NOT report false positives:
+   - Code in comments or documentation
+   - Issues handled by the type system
+   - Intentional defensive code
+   - "Missing error handling" when errors are handled upstream
+   - Already-fixed issues (check the actual code!)
+   - Tech debt that is not a bug
+
+4. JSON schema for each issue:
+   {
+     "severity": "high|medium|low",
+     "line": 42,
+     "description": "Clear description of the bug",
+     "code_snippet": "the problematic code",
+     "suggested_fix": "how to fix it",
+     "confidence": 0.85,
+     "category": "security|performance|correctness|style"
+   }
+'
+
+# Specialized prompts
+security_prompt='
+SECURITY AGENT - Focus ONLY on security vulnerabilities:
+- Injection attacks (SQL, command, path traversal, SSRF)
+- Authentication/authorization bypasses
+- Secrets/credentials/API keys in code
+- Unsafe deserialization
+- Input validation failures
+- Cryptographic weaknesses
+- Race conditions that could be exploited
+
+Ignore: style issues, performance, general correctness
+'
+
+performance_prompt='
+PERFORMANCE AGENT - Focus ONLY on performance issues:
+- O(N²) or worse algorithms (nested loops over same data)
+- Unnecessary allocations in hot paths/loops
+- Missing memoization where pure functions are called repeatedly
+- Blocking operations that could be async
+- Memory leaks (unbounded growth)
+- Inefficient data structure choices
+
+Ignore: style issues, security (unless performance-related), minor correctness
+'
+
+correctness_prompt='
+CORRECTNESS AGENT - Focus ONLY on logic bugs:
+- Off-by-one errors in loops/indices
+- Null/undefined/empty handling missing
+- Edge cases: empty input, negative numbers, overflow
+- Type coercion bugs
+- Incorrect boolean logic
+- Race conditions
+- State management bugs
+- Incorrect algorithm implementation
+
+Ignore: style issues, performance (unless causes incorrect results), security
+'
+
+# ============================================================
+# PHASE 1: QA Review
+# ============================================================
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "📝 PHASE 1: QA Review"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+
+# Build the QA prompt
+if [[ "$specialized" == true ]]; then
+    qa_prompt="You are coordinating a SPECIALIZED QA flashmob. Spawn 3 Gemini Flash agents in parallel using the gemini-cli skill.
+
+Each agent has a SPECIFIC FOCUS and reviews ALL files but only reports issues in their domain.
+
+Agent Assignments:
+
+agent-security:
+  Files: ${agent_files[0]}
+  Focus: SECURITY ONLY
+$security_prompt
+
+agent-performance:
+  Files: ${agent_files[1]}
+  Focus: PERFORMANCE ONLY
+$performance_prompt
+
+agent-correctness:
+  Files: ${agent_files[2]}
+  Focus: CORRECTNESS ONLY
+$correctness_prompt
+
+$base_qa_instructions
+
+Save findings to reports/gemini-flashmob-<agent_id>.json with the enhanced schema.
+Spawn all agents in parallel. Summarize findings by category when complete."
+
+elif [[ "$cross_validate" == true ]]; then
+    qa_prompt="You are coordinating a CROSS-VALIDATION QA flashmob. Spawn $num_agents Gemini Flash agents in parallel using the gemini-cli skill.
+
+CRITICAL: All agents review the SAME files independently. We will only keep issues that 2+ agents agree on.
+
+Files for ALL agents: ${agent_files[0]}
+
+Agent IDs:"
+    for ((i=0; i<num_agents; i++)); do
+        qa_prompt+="
+- ${agent_ids[$i]}"
+    done
+    qa_prompt+="
+
+$base_qa_instructions
+
+IMPORTANT: Each agent should work independently without seeing other agents' results.
+
+Save findings to reports/gemini-flashmob-<agent_id>.json.
+Spawn all agents in parallel. After completion, identify consensus issues (reported by 2+ agents)."
+
+else
+    # Standard mode
+    qa_prompt="You are coordinating a QA flashmob. Spawn $num_agents Gemini Flash agents in parallel using the gemini-cli skill.
+
+CRITICAL: Each agent must review ONLY their assigned files. Do NOT let agents pick random files.
+
+Agent Assignments:
+"
+    for ((i=0; i<num_agents; i++)); do
+        qa_prompt+="
+${agent_ids[$i]}:
+  Files: ${agent_files[$i]}
+"
+    done
+
+    qa_prompt+="
+$base_qa_instructions
+
+Save findings to reports/gemini-flashmob-<agent_id>.json with the enhanced schema.
+Spawn all agents in parallel. Summarize findings when complete."
+fi
+
+# Execute QA phase
+if [[ "$do_stream" == true ]]; then
+    # Streaming mode: run in background and monitor
+    echo "Starting QA agents (streaming mode)..."
+    claude --print --model opus --dangerously-skip-permissions "$qa_prompt" &
+    qa_pid=$!
+
+    # Monitor for completions
+    shown_reports=""
+    while kill -0 $qa_pid 2>/dev/null; do
+        for report in reports/gemini-flashmob-*.json; do
+            [[ ! -f "$report" ]] && continue
+            report_name=$(basename "$report")
+            if [[ ! "$shown_reports" =~ "$report_name" ]]; then
+                if jq -e . "$report" >/dev/null 2>&1; then
+                    echo ""
+                    echo "✓ $report_name complete"
+                    issue_count=$(jq '[.files_reviewed[].issues | length] | add // 0' "$report" 2>/dev/null || echo "?")
+                    echo "  Issues found: $issue_count"
+                    shown_reports+=" $report_name"
+                fi
+            fi
+        done
+        sleep 3
+    done
+    wait $qa_pid || true
+    echo ""
+else
+    # Blocking mode
+    claude --print --model opus --dangerously-skip-permissions "$qa_prompt"
+fi
+
+# ============================================================
+# LINE NUMBER CORRECTION
+# ============================================================
+if [[ "$do_line_correct" == true ]]; then
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "🔧 Correcting line numbers..."
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    for report in reports/gemini-flashmob-*.json; do
+        [[ ! -f "$report" ]] && continue
+
+        # Create corrected version
+        corrected=$(mktemp)
+        corrections=0
+
+        # Process each file's issues
+        jq -c '.files_reviewed[]?' "$report" 2>/dev/null | while read -r file_entry; do
+            file_path=$(echo "$file_entry" | jq -r '.file')
+            [[ ! -f "$file_path" ]] && continue
+
+            echo "$file_entry" | jq -c '.issues[]?' | while read -r issue; do
+                snippet=$(echo "$issue" | jq -r '.code_snippet // empty')
+                [[ -z "$snippet" ]] && continue
+
+                # Try to find the snippet in the file
+                # Use first significant line of snippet
+                first_line=$(echo "$snippet" | head -1 | sed 's/^[[:space:]]*//' | head -c 60)
+                [[ -z "$first_line" ]] && continue
+
+                actual_line=$(grep -n -F "$first_line" "$file_path" 2>/dev/null | head -1 | cut -d: -f1)
+                if [[ -n "$actual_line" ]]; then
+                    reported_line=$(echo "$issue" | jq -r '.line')
+                    if [[ "$actual_line" != "$reported_line" ]]; then
+                        ((corrections++)) || true
+                        echo "  $file_path: $reported_line → $actual_line"
+                    fi
+                fi
+            done
+        done
+
+        # Note: Full in-place correction would require more complex jq manipulation
+        # For now, we just report discrepancies
+    done
+    echo "  Line correction pass complete"
+fi
+
+# ============================================================
+# CROSS-VALIDATION CONSENSUS
+# ============================================================
+if [[ "$cross_validate" == true ]]; then
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "🔀 Computing consensus..."
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    # Collect all issues with file:line keys
+    declare -A issue_counts
+    declare -A issue_details
+
+    for report in reports/gemini-flashmob-*.json; do
+        [[ ! -f "$report" ]] && continue
+
+        jq -c '.files_reviewed[]?' "$report" 2>/dev/null | while read -r file_entry; do
+            file_path=$(echo "$file_entry" | jq -r '.file')
+            echo "$file_entry" | jq -c '.issues[]?' | while read -r issue; do
+                line=$(echo "$issue" | jq -r '.line')
+                key="${file_path}:${line}"
+                echo "$key"
+            done
+        done
+    done | sort | uniq -c | while read -r count key; do
+        if [[ $count -ge 2 ]]; then
+            echo "  ✓ Consensus ($count agents): $key"
+        fi
+    done
+
+    echo "  Consensus computation complete"
+fi
+
+# ============================================================
+# PHASE 2: Triage Validation
+# ============================================================
+if [[ "$do_triage" == true ]]; then
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "🔬 PHASE 2: Triage Validation"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+
+    triage_prompt="You are coordinating the TRIAGE phase of a QA flashmob. The QA agents have produced reports that need validation.
+
+For each QA report in reports/gemini-flashmob-*.json, spawn a triage agent using the gemini-cli skill.
+
+Each triage agent should:
+1. Read the QA report (reports/gemini-flashmob-<agent-id>.json)
+2. Read each file that was reviewed
+3. For EACH issue found by the QA agent:
+   - VALIDATE: Is this a real bug/issue? (confirmed/rejected/uncertain)
+   - Check if the code_snippet matches the actual file content
+   - SEVERITY CHECK: Is the severity rating accurate?
+   - Add your reasoning
+4. CHECK FOR GAPS: Look for issues the QA agent MISSED
+   - Security vulnerabilities
+   - Edge cases not handled
+   - Logic errors
+   - Performance issues
+5. Save triaged findings to reports/triage-<agent-id>.json:
+   {
+     \"triage_id\": \"triage-<agent-id>\",
+     \"original_report\": \"gemini-flashmob-<agent-id>.json\",
+     \"timestamp\": \"<ISO timestamp>\",
+     \"validated_issues\": [
+       {
+         \"file\": \"path/to/file\",
+         \"line\": N,
+         \"original_description\": \"...\",
+         \"original_severity\": \"high|medium|low\",
+         \"validation\": \"confirmed|rejected|uncertain\",
+         \"adjusted_severity\": \"high|medium|low|null\",
+         \"reasoning\": \"why this is/isn't a real issue\"
+       }
+     ],
+     \"gaps_found\": [
+       {
+         \"file\": \"path/to/file\",
+         \"line\": N,
+         \"severity\": \"high|medium|low\",
+         \"description\": \"issue that was missed\",
+         \"category\": \"security|logic|edge-case|performance|other\"
+       }
+     ],
+     \"summary\": {
+       \"confirmed\": N,
+       \"rejected\": N,
+       \"uncertain\": N,
+       \"gaps_found\": N,
+       \"notes\": \"overall triage summary\"
+     }
+   }
+
+Spawn triage agents in parallel. When complete, produce a FINAL SUMMARY showing:
+- Total confirmed issues by severity
+- Total rejected (false positives)
+- Total gaps found by the triage agents
+- High-confidence issues to prioritize"
+
+    if [[ "$do_stream" == true ]]; then
+        claude --print --model opus --dangerously-skip-permissions "$triage_prompt" &
+        triage_pid=$!
+
+        shown_triage=""
+        while kill -0 $triage_pid 2>/dev/null; do
+            for report in reports/triage-*.json; do
+                [[ ! -f "$report" ]] && continue
+                report_name=$(basename "$report")
+                if [[ ! "$shown_triage" =~ "$report_name" ]]; then
+                    if jq -e . "$report" >/dev/null 2>&1; then
+                        echo ""
+                        echo "✓ $report_name complete"
+                        summary=$(jq -r '.summary | "Confirmed: \(.confirmed), Rejected: \(.rejected), Gaps: \(.gaps_found)"' "$report" 2>/dev/null || echo "...")
+                        echo "  $summary"
+                        shown_triage+=" $report_name"
+                    fi
+                fi
+            done
+            sleep 3
+        done
+        wait $triage_pid || true
+    else
+        claude --print --model opus --dangerously-skip-permissions "$triage_prompt"
+    fi
+fi
+
+# ============================================================
+# PHASE 3: Bead Creation
+# ============================================================
+if [[ "$do_create_beads" == true ]]; then
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "📋 PHASE 3: Creating Beads"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    # Map severity to priority
+    severity_to_priority() {
+        case "$1" in
+            high) echo 1 ;;
+            medium) echo 2 ;;
+            low) echo 3 ;;
+            *) echo 2 ;;
+        esac
+    }
+
+    # Check threshold
+    meets_threshold() {
+        local sev="$1"
+        case "$bead_threshold" in
+            high) [[ "$sev" == "high" ]] ;;
+            medium) [[ "$sev" == "high" || "$sev" == "medium" ]] ;;
+            low) true ;;
+        esac
+    }
+
+    created_beads=0
+
+    for triage_report in reports/triage-*.json; do
+        [[ ! -f "$triage_report" ]] && continue
+
+        # Process confirmed issues
+        jq -c '.validated_issues[]? | select(.validation == "confirmed")' "$triage_report" 2>/dev/null | while read -r issue; do
+            severity=$(echo "$issue" | jq -r '.adjusted_severity // .original_severity')
+
+            if meets_threshold "$severity"; then
+                file=$(echo "$issue" | jq -r '.file')
+                line=$(echo "$issue" | jq -r '.line')
+                desc=$(echo "$issue" | jq -r '.original_description' | head -c 100)
+                reasoning=$(echo "$issue" | jq -r '.reasoning')
+                priority=$(severity_to_priority "$severity")
+
+                # Create the bead
+                bead_id=$(bd create \
+                    --title="[flashmob] $desc" \
+                    --type=bug \
+                    --priority="$priority" 2>&1 | grep -oE 'fold-[a-z0-9]+' | head -1)
+
+                if [[ -n "$bead_id" ]]; then
+                    echo "  ✓ Created $bead_id: $desc"
+                    ((created_beads++)) || true
+                fi
+            fi
+        done
+
+        # Process gaps found
+        jq -c '.gaps_found[]?' "$triage_report" 2>/dev/null | while read -r gap; do
+            severity=$(echo "$gap" | jq -r '.severity')
+
+            if meets_threshold "$severity"; then
+                file=$(echo "$gap" | jq -r '.file')
+                line=$(echo "$gap" | jq -r '.line')
+                desc=$(echo "$gap" | jq -r '.description' | head -c 100)
+                category=$(echo "$gap" | jq -r '.category')
+                priority=$(severity_to_priority "$severity")
+
+                bead_id=$(bd create \
+                    --title="[flashmob-gap] $desc" \
+                    --type=bug \
+                    --priority="$priority" 2>&1 | grep -oE 'fold-[a-z0-9]+' | head -1)
+
+                if [[ -n "$bead_id" ]]; then
+                    echo "  ✓ Created $bead_id (gap): $desc"
+                    ((created_beads++)) || true
+                fi
+            fi
+        done
+    done
+
+    echo ""
+    echo "  Created $created_beads bead(s)"
+fi
+
+# ============================================================
+# Update history
+# ============================================================
+if [[ "$use_history" == true ]]; then
+    echo "$selected_files" >> "$history_file"
+    sort -u "$history_file" -o "$history_file"
+    echo ""
+    echo "📜 Updated history: $(wc -l < "$history_file") files tracked"
+fi
+
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "✅ flashmob v4 complete"
+echo "   Reports: reports/gemini-flashmob-*.json"
+if [[ "$do_triage" == true ]]; then
+    echo "   Triage:  reports/triage-*.json"
+fi
+if [[ "$do_create_beads" == true ]]; then
+    echo "   Beads:   Created from confirmed issues"
+fi
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
