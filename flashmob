@@ -8,8 +8,6 @@
 #   -m MODE             Mode: random|clustered|coverage (default: coverage)
 #   -s, --specialized   Use specialized agents (security/perf/correctness)
 #   -x, --cross-validate  Cross-validate with multiple agents per file
-#   --create-beads      Create beads from confirmed issues
-#   --bead-threshold    Minimum severity for beads (default: medium)
 #   --no-line-correct   Skip line number correction
 #   --no-triage         Skip triage validation phase
 #   --no-stream         Disable streaming output (wait for all agents)
@@ -38,8 +36,6 @@ use_history=true
 do_triage=true
 do_line_correct=true
 do_stream=true
-do_create_beads=false
-bead_threshold="medium"
 specialized=false
 cross_validate=false
 dry_run=false
@@ -53,8 +49,6 @@ while [[ $# -gt 0 ]]; do
         -m) mode="$2"; shift 2 ;;
         -s|--specialized) specialized=true; shift ;;
         -x|--cross-validate) cross_validate=true; shift ;;
-        --create-beads) do_create_beads=true; shift ;;
-        --bead-threshold) bead_threshold="$2"; shift 2 ;;
         --no-line-correct) do_line_correct=false; shift ;;
         --no-triage) do_triage=false; shift ;;
         --no-stream) do_stream=false; shift ;;
@@ -108,7 +102,6 @@ else
 fi
 echo "🎯 Mode: $mode"
 echo "🔍 Triage: $do_triage"
-[[ "$do_create_beads" == true ]] && echo "📋 Beads: enabled (threshold: $bead_threshold)"
 echo ""
 
 # Load history if enabled
@@ -606,92 +599,6 @@ Spawn triage agents in parallel. When complete, produce a FINAL SUMMARY showing:
 fi
 
 # ============================================================
-# PHASE 3: Bead Creation
-# ============================================================
-if [[ "$do_create_beads" == true ]]; then
-    echo ""
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "📋 PHASE 3: Creating Beads"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
-    # Map severity to priority
-    severity_to_priority() {
-        case "$1" in
-            high) echo 1 ;;
-            medium) echo 2 ;;
-            low) echo 3 ;;
-            *) echo 2 ;;
-        esac
-    }
-
-    # Check threshold
-    meets_threshold() {
-        local sev="$1"
-        case "$bead_threshold" in
-            high) [[ "$sev" == "high" ]] ;;
-            medium) [[ "$sev" == "high" || "$sev" == "medium" ]] ;;
-            low) true ;;
-        esac
-    }
-
-    created_beads=0
-
-    for triage_report in reports/triage-*.json; do
-        [[ ! -f "$triage_report" ]] && continue
-
-        # Process confirmed issues
-        jq -c '.validated_issues[]? | select(.validation == "confirmed")' "$triage_report" 2>/dev/null | while read -r issue; do
-            severity=$(echo "$issue" | jq -r '.adjusted_severity // .original_severity')
-
-            if meets_threshold "$severity"; then
-                file=$(echo "$issue" | jq -r '.file')
-                line=$(echo "$issue" | jq -r '.line')
-                desc=$(echo "$issue" | jq -r '.original_description' | head -c 100)
-                reasoning=$(echo "$issue" | jq -r '.reasoning')
-                priority=$(severity_to_priority "$severity")
-
-                # Create the bead
-                bead_id=$(bd create \
-                    --title="[flashmob] $desc" \
-                    --type=bug \
-                    --priority="$priority" 2>&1 | grep -oE 'fold-[a-z0-9]+' | head -1)
-
-                if [[ -n "$bead_id" ]]; then
-                    echo "  ✓ Created $bead_id: $desc"
-                    ((created_beads++)) || true
-                fi
-            fi
-        done
-
-        # Process gaps found
-        jq -c '.gaps_found[]?' "$triage_report" 2>/dev/null | while read -r gap; do
-            severity=$(echo "$gap" | jq -r '.severity')
-
-            if meets_threshold "$severity"; then
-                file=$(echo "$gap" | jq -r '.file')
-                line=$(echo "$gap" | jq -r '.line')
-                desc=$(echo "$gap" | jq -r '.description' | head -c 100)
-                category=$(echo "$gap" | jq -r '.category')
-                priority=$(severity_to_priority "$severity")
-
-                bead_id=$(bd create \
-                    --title="[flashmob-gap] $desc" \
-                    --type=bug \
-                    --priority="$priority" 2>&1 | grep -oE 'fold-[a-z0-9]+' | head -1)
-
-                if [[ -n "$bead_id" ]]; then
-                    echo "  ✓ Created $bead_id (gap): $desc"
-                    ((created_beads++)) || true
-                fi
-            fi
-        done
-    done
-
-    echo ""
-    echo "  Created $created_beads bead(s)"
-fi
-
-# ============================================================
 # Update history
 # ============================================================
 if [[ "$use_history" == true ]]; then
@@ -707,8 +614,5 @@ echo "✅ flashmob v4 complete"
 echo "   Reports: reports/gemini-flashmob-*.json"
 if [[ "$do_triage" == true ]]; then
     echo "   Triage:  reports/triage-*.json"
-fi
-if [[ "$do_create_beads" == true ]]; then
-    echo "   Beads:   Created from confirmed issues"
 fi
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
