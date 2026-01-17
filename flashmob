@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# flashmob v4: Intelligent QA swarm with advanced features
+# flashmob v5: Intelligent QA swarm with advanced features
 # Usage: flashmob [options] [directories...]
 #
 # Options:
@@ -8,6 +8,9 @@
 #   -m MODE             Mode: random|clustered|coverage (default: coverage)
 #   -s, --specialized   Use specialized agents (security/perf/correctness)
 #   -x, --cross-validate  Cross-validate with multiple agents per file
+#   -q, --quick         Quick mode: 1 agent, 3 files, no triage, direct Gemini
+#   -d, --direct        Direct Gemini invocation (skip Claude orchestration)
+#   -t, --timeout SEC   Timeout per agent in seconds (default: 120)
 #   --no-line-correct   Skip line number correction
 #   --no-triage         Skip triage validation phase
 #   --no-stream         Disable streaming output (wait for all agents)
@@ -24,6 +27,7 @@
 # Special Modes:
 #   --specialized    - Run 3 focused agents: security, performance, correctness
 #   --cross-validate - All agents review same files, report consensus only
+#   --quick          - Fast feedback: direct Gemini, minimal config
 
 set -euo pipefail
 
@@ -40,6 +44,9 @@ specialized=false
 cross_validate=false
 dry_run=false
 extensions="ss"
+quick_mode=false
+direct_mode=false
+agent_timeout=120
 
 # Parse options
 while [[ $# -gt 0 ]]; do
@@ -49,6 +56,9 @@ while [[ $# -gt 0 ]]; do
         -m) mode="$2"; shift 2 ;;
         -s|--specialized) specialized=true; shift ;;
         -x|--cross-validate) cross_validate=true; shift ;;
+        -q|--quick) quick_mode=true; shift ;;
+        -d|--direct) direct_mode=true; shift ;;
+        -t|--timeout) agent_timeout="$2"; shift 2 ;;
         --no-line-correct) do_line_correct=false; shift ;;
         --no-triage) do_triage=false; shift ;;
         --no-stream) do_stream=false; shift ;;
@@ -57,13 +67,22 @@ while [[ $# -gt 0 ]]; do
         --extensions) extensions="$2"; shift 2 ;;
         --dry-run) dry_run=true; shift ;;
         -h|--help)
-            head -30 "$0" | tail -28
+            head -34 "$0" | tail -32
             exit 0
             ;;
         -*) echo "Unknown option: $1"; exit 1 ;;
         *) break ;;
     esac
 done
+
+# Quick mode overrides
+if [[ "$quick_mode" == true ]]; then
+    num_agents=1
+    files_per_agent=3
+    do_triage=false
+    direct_mode=true
+    do_line_correct=false
+fi
 
 dirs=("$@")
 [[ ${#dirs[@]} -eq 0 ]] && dirs=(".")
@@ -78,16 +97,18 @@ done
 
 # Find all candidate files
 all_files=$(eval "find ${dirs[*]} -type f \( $ext_pattern \)" 2>/dev/null | grep -v '/\.' | sort)
-total_files=$(echo "$all_files" | wc -l)
+total_files=$(echo "$all_files" | grep -c . || echo 0)
 
-# Adjust for special modes
-if [[ "$specialized" == true ]]; then
+# Header
+if [[ "$quick_mode" == true ]]; then
+    echo "🎆 flashmob v5 - Quick Mode"
+elif [[ "$specialized" == true ]]; then
     num_agents=3  # Always 3: security, performance, correctness
-    echo "🎆 flashmob v4 - Specialized QA Swarm"
+    echo "🎆 flashmob v5 - Specialized QA Swarm"
 elif [[ "$cross_validate" == true ]]; then
-    echo "🎆 flashmob v4 - Cross-Validation Mode"
+    echo "🎆 flashmob v5 - Cross-Validation Mode"
 else
-    echo "🎆 flashmob v4 - Intelligent QA Swarm"
+    echo "🎆 flashmob v5 - Intelligent QA Swarm"
 fi
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -101,6 +122,8 @@ else
     echo "🤖 Agents: $num_agents × $files_per_agent files = $((num_agents * files_per_agent)) reviews"
 fi
 echo "🎯 Mode: $mode"
+[[ "$direct_mode" == true ]] && echo "⚡ Direct: Gemini (no Claude orchestration)"
+echo "⏱️  Timeout: ${agent_timeout}s per agent"
 echo "🔍 Triage: $do_triage"
 echo ""
 
@@ -235,10 +258,10 @@ mkdir -p reports
 rm -f reports/*.shown 2>/dev/null || true
 
 # ============================================================
-# IMPROVED PROMPTS
+# PROMPTS
 # ============================================================
 
-# Base QA instructions with better prompting
+# Base QA instructions
 base_qa_instructions='
 QUALITY REQUIREMENTS:
 1. For each issue, you MUST include:
@@ -265,6 +288,7 @@ QUALITY REQUIREMENTS:
    {
      "severity": "high|medium|low",
      "line": 42,
+     "file": "path/to/file.ss",
      "description": "Clear description of the bug",
      "code_snippet": "the problematic code",
      "suggested_fix": "how to fix it",
@@ -314,6 +338,85 @@ Ignore: style issues, performance (unless causes incorrect results), security
 '
 
 # ============================================================
+# Progress spinner
+# ============================================================
+spinner_chars='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+spin_idx=0
+
+show_spinner() {
+    local msg="$1"
+    printf "\r${spinner_chars:$spin_idx:1} %s" "$msg"
+    spin_idx=$(( (spin_idx + 1) % 10 ))
+}
+
+# ============================================================
+# DIRECT GEMINI MODE
+# ============================================================
+run_direct_gemini() {
+    local agent_id="$1"
+    local files="$2"
+    local focus="$3"
+    local focus_prompt=""
+
+    case "$focus" in
+        security) focus_prompt="$security_prompt" ;;
+        performance) focus_prompt="$performance_prompt" ;;
+        correctness) focus_prompt="$correctness_prompt" ;;
+        *) focus_prompt="Review for all issue types: security, performance, correctness." ;;
+    esac
+
+    # Read file contents
+    local file_contents=""
+    local file_num=1
+    IFS=',' read -ra FILE_ARR <<< "$files"
+    for file in "${FILE_ARR[@]}"; do
+        if [[ -f "$file" ]]; then
+            # Limit to first 200 lines per file
+            local content
+            content=$(head -200 "$file" 2>/dev/null || true)
+            file_contents+="
+=== FILE $file_num: $file ===
+\`\`\`scheme
+$content
+\`\`\`
+"
+            ((file_num++))
+        fi
+    done
+
+    local prompt="You are reviewing Scheme code for ${focus^^} issues.
+
+$focus_prompt
+
+$base_qa_instructions
+
+Files to review:
+$file_contents
+
+Output ONLY a JSON array of issues found. If no issues, output [].
+Example format:
+[
+  {
+    \"severity\": \"high|medium|low\",
+    \"line\": 42,
+    \"file\": \"filename.ss\",
+    \"description\": \"Clear description\",
+    \"code_snippet\": \"problematic code\",
+    \"suggested_fix\": \"how to fix\",
+    \"confidence\": 0.85,
+    \"category\": \"$focus\"
+  }
+]"
+
+    # Run with timeout
+    timeout "$agent_timeout" gemini -m gemini-2.5-flash --output-format json "$prompt" 2>/dev/null \
+        > "reports/gemini-flashmob-${agent_id}.json" || {
+        echo "[]" > "reports/gemini-flashmob-${agent_id}.json"
+        echo "  ⚠️  $agent_id timed out or failed"
+    }
+}
+
+# ============================================================
 # PHASE 1: QA Review
 # ============================================================
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -321,9 +424,69 @@ echo "📝 PHASE 1: QA Review"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
-# Build the QA prompt
-if [[ "$specialized" == true ]]; then
-    qa_prompt="You are coordinating a SPECIALIZED QA flashmob. Spawn 3 Gemini Flash agents in parallel using the gemini-cli skill.
+if [[ "$direct_mode" == true ]]; then
+    # Direct Gemini mode - spawn agents directly
+    echo "Starting QA agents (direct Gemini mode)..."
+
+    pids=()
+    for ((i=0; i<${#agent_ids[@]}; i++)); do
+        run_direct_gemini "${agent_ids[$i]}" "${agent_files[$i]}" "${agent_types[$i]}" &
+        pids+=($!)
+    done
+
+    # Wait with progress
+    echo ""
+    while true; do
+        all_done=true
+        for pid in "${pids[@]}"; do
+            if kill -0 "$pid" 2>/dev/null; then
+                all_done=false
+                break
+            fi
+        done
+
+        if [[ "$all_done" == true ]]; then
+            break
+        fi
+
+        # Check for completed reports
+        for ((i=0; i<${#agent_ids[@]}; i++)); do
+            report="reports/gemini-flashmob-${agent_ids[$i]}.json"
+            shown_file="$report.shown"
+            if [[ -f "$report" && ! -f "$shown_file" ]]; then
+                if jq -e . "$report" >/dev/null 2>&1; then
+                    # Fix: reports are flat arrays, not nested
+                    issue_count=$(jq 'if type == "array" then length else 0 end' "$report" 2>/dev/null || echo "?")
+                    echo "✓ ${agent_ids[$i]} complete - $issue_count issues"
+                    touch "$shown_file"
+                fi
+            fi
+        done
+
+        show_spinner "Waiting for agents..."
+        sleep 1
+    done
+
+    # Final check for any reports not yet shown
+    for ((i=0; i<${#agent_ids[@]}; i++)); do
+        report="reports/gemini-flashmob-${agent_ids[$i]}.json"
+        shown_file="$report.shown"
+        if [[ -f "$report" && ! -f "$shown_file" ]]; then
+            if jq -e . "$report" >/dev/null 2>&1; then
+                issue_count=$(jq 'if type == "array" then length else 0 end' "$report" 2>/dev/null || echo "?")
+                echo "✓ ${agent_ids[$i]} complete - $issue_count issues"
+                touch "$shown_file"
+            fi
+        fi
+    done
+
+    printf "\r                                        \n"
+    wait "${pids[@]}" 2>/dev/null || true
+
+else
+    # Claude orchestration mode (original behavior)
+    if [[ "$specialized" == true ]]; then
+        qa_prompt="You are coordinating a SPECIALIZED QA flashmob. Spawn 3 Gemini Flash agents in parallel using the gemini-cli skill.
 
 Each agent has a SPECIFIC FOCUS and reviews ALL files but only reports issues in their domain.
 
@@ -349,19 +512,19 @@ $base_qa_instructions
 Save findings to reports/gemini-flashmob-<agent_id>.json with the enhanced schema.
 Spawn all agents in parallel. Summarize findings by category when complete."
 
-elif [[ "$cross_validate" == true ]]; then
-    qa_prompt="You are coordinating a CROSS-VALIDATION QA flashmob. Spawn $num_agents Gemini Flash agents in parallel using the gemini-cli skill.
+    elif [[ "$cross_validate" == true ]]; then
+        qa_prompt="You are coordinating a CROSS-VALIDATION QA flashmob. Spawn $num_agents Gemini Flash agents in parallel using the gemini-cli skill.
 
 CRITICAL: All agents review the SAME files independently. We will only keep issues that 2+ agents agree on.
 
 Files for ALL agents: ${agent_files[0]}
 
 Agent IDs:"
-    for ((i=0; i<num_agents; i++)); do
-        qa_prompt+="
+        for ((i=0; i<num_agents; i++)); do
+            qa_prompt+="
 - ${agent_ids[$i]}"
-    done
-    qa_prompt+="
+        done
+        qa_prompt+="
 
 $base_qa_instructions
 
@@ -370,58 +533,64 @@ IMPORTANT: Each agent should work independently without seeing other agents' res
 Save findings to reports/gemini-flashmob-<agent_id>.json.
 Spawn all agents in parallel. After completion, identify consensus issues (reported by 2+ agents)."
 
-else
-    # Standard mode
-    qa_prompt="You are coordinating a QA flashmob. Spawn $num_agents Gemini Flash agents in parallel using the gemini-cli skill.
+    else
+        # Standard mode
+        qa_prompt="You are coordinating a QA flashmob. Spawn $num_agents Gemini Flash agents in parallel using the gemini-cli skill.
 
 CRITICAL: Each agent must review ONLY their assigned files. Do NOT let agents pick random files.
 
 Agent Assignments:
 "
-    for ((i=0; i<num_agents; i++)); do
-        qa_prompt+="
+        for ((i=0; i<num_agents; i++)); do
+            qa_prompt+="
 ${agent_ids[$i]}:
   Files: ${agent_files[$i]}
 "
-    done
+        done
 
-    qa_prompt+="
+        qa_prompt+="
 $base_qa_instructions
 
 Save findings to reports/gemini-flashmob-<agent_id>.json with the enhanced schema.
 Spawn all agents in parallel. Summarize findings when complete."
-fi
+    fi
 
-# Execute QA phase
-if [[ "$do_stream" == true ]]; then
-    # Streaming mode: run in background and monitor
-    echo "Starting QA agents (streaming mode)..."
-    claude --print --model opus --dangerously-skip-permissions "$qa_prompt" &
-    qa_pid=$!
+    # Execute QA phase
+    if [[ "$do_stream" == true ]]; then
+        # Streaming mode: run in background and monitor
+        echo "Starting QA agents (streaming mode)..."
+        timeout "$((agent_timeout * num_agents))" claude --print --model opus --dangerously-skip-permissions "$qa_prompt" &
+        qa_pid=$!
 
-    # Monitor for completions
-    shown_reports=""
-    while kill -0 $qa_pid 2>/dev/null; do
-        for report in reports/gemini-flashmob-*.json; do
-            [[ ! -f "$report" ]] && continue
-            report_name=$(basename "$report")
-            if [[ ! "$shown_reports" =~ "$report_name" ]]; then
-                if jq -e . "$report" >/dev/null 2>&1; then
-                    echo ""
-                    echo "✓ $report_name complete"
-                    issue_count=$(jq '[.files_reviewed[].issues | length] | add // 0' "$report" 2>/dev/null || echo "?")
-                    echo "  Issues found: $issue_count"
-                    shown_reports+=" $report_name"
+        # Monitor for completions
+        shown_reports=""
+        while kill -0 $qa_pid 2>/dev/null; do
+            for report in reports/gemini-flashmob-*.json; do
+                [[ ! -f "$report" ]] && continue
+                report_name=$(basename "$report")
+                if [[ ! "$shown_reports" =~ "$report_name" ]]; then
+                    if jq -e . "$report" >/dev/null 2>&1; then
+                        echo ""
+                        echo "✓ $report_name complete"
+                        # Fix: handle both flat arrays and nested structures
+                        issue_count=$(jq 'if type == "array" then length elif .findings then (.findings | length) else 0 end' "$report" 2>/dev/null || echo "?")
+                        echo "  Issues found: $issue_count"
+                        shown_reports+=" $report_name"
+                    fi
                 fi
-            fi
+            done
+            show_spinner "Waiting for agents..."
+            sleep 2
         done
-        sleep 3
-    done
-    wait $qa_pid || true
-    echo ""
-else
-    # Blocking mode
-    claude --print --model opus --dangerously-skip-permissions "$qa_prompt"
+        printf "\r                                        \n"
+        wait $qa_pid || true
+        echo ""
+    else
+        # Blocking mode
+        timeout "$((agent_timeout * num_agents))" claude --print --model opus --dangerously-skip-permissions "$qa_prompt" || {
+            echo "⚠️  QA phase timed out"
+        }
+    fi
 fi
 
 # ============================================================
@@ -436,37 +605,29 @@ if [[ "$do_line_correct" == true ]]; then
     for report in reports/gemini-flashmob-*.json; do
         [[ ! -f "$report" ]] && continue
 
-        # Create corrected version
-        corrected=$(mktemp)
         corrections=0
 
-        # Process each file's issues
-        jq -c '.files_reviewed[]?' "$report" 2>/dev/null | while read -r file_entry; do
-            file_path=$(echo "$file_entry" | jq -r '.file')
-            [[ ! -f "$file_path" ]] && continue
+        # Handle flat array format
+        jq -c '.[]?' "$report" 2>/dev/null | while read -r issue; do
+            file_path=$(echo "$issue" | jq -r '.file // empty')
+            [[ -z "$file_path" || ! -f "$file_path" ]] && continue
 
-            echo "$file_entry" | jq -c '.issues[]?' | while read -r issue; do
-                snippet=$(echo "$issue" | jq -r '.code_snippet // empty')
-                [[ -z "$snippet" ]] && continue
+            snippet=$(echo "$issue" | jq -r '.code_snippet // empty')
+            [[ -z "$snippet" ]] && continue
 
-                # Try to find the snippet in the file
-                # Use first significant line of snippet
-                first_line=$(echo "$snippet" | head -1 | sed 's/^[[:space:]]*//' | head -c 60)
-                [[ -z "$first_line" ]] && continue
+            # Try to find the snippet in the file
+            first_line=$(echo "$snippet" | head -1 | sed 's/^[[:space:]]*//' | head -c 60)
+            [[ -z "$first_line" ]] && continue
 
-                actual_line=$(grep -n -F "$first_line" "$file_path" 2>/dev/null | head -1 | cut -d: -f1)
-                if [[ -n "$actual_line" ]]; then
-                    reported_line=$(echo "$issue" | jq -r '.line')
-                    if [[ "$actual_line" != "$reported_line" ]]; then
-                        ((corrections++)) || true
-                        echo "  $file_path: $reported_line → $actual_line"
-                    fi
+            actual_line=$(grep -n -F "$first_line" "$file_path" 2>/dev/null | head -1 | cut -d: -f1)
+            if [[ -n "$actual_line" ]]; then
+                reported_line=$(echo "$issue" | jq -r '.line')
+                if [[ "$actual_line" != "$reported_line" ]]; then
+                    ((corrections++)) || true
+                    echo "  $file_path: $reported_line → $actual_line"
                 fi
-            done
+            fi
         done
-
-        # Note: Full in-place correction would require more complex jq manipulation
-        # For now, we just report discrepancies
     done
     echo "  Line correction pass complete"
 fi
@@ -480,20 +641,13 @@ if [[ "$cross_validate" == true ]]; then
     echo "🔀 Computing consensus..."
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-    # Collect all issues with file:line keys
-    declare -A issue_counts
-    declare -A issue_details
-
     for report in reports/gemini-flashmob-*.json; do
         [[ ! -f "$report" ]] && continue
 
-        jq -c '.files_reviewed[]?' "$report" 2>/dev/null | while read -r file_entry; do
-            file_path=$(echo "$file_entry" | jq -r '.file')
-            echo "$file_entry" | jq -c '.issues[]?' | while read -r issue; do
-                line=$(echo "$issue" | jq -r '.line')
-                key="${file_path}:${line}"
-                echo "$key"
-            done
+        jq -c '.[]?' "$report" 2>/dev/null | while read -r issue; do
+            file_path=$(echo "$issue" | jq -r '.file // empty')
+            line=$(echo "$issue" | jq -r '.line // 0')
+            [[ -n "$file_path" ]] && echo "${file_path}:${line}"
         done
     done | sort | uniq -c | while read -r count key; do
         if [[ $count -ge 2 ]]; then
@@ -572,7 +726,7 @@ Spawn triage agents in parallel. When complete, produce a FINAL SUMMARY showing:
 - High-confidence issues to prioritize"
 
     if [[ "$do_stream" == true ]]; then
-        claude --print --model opus --dangerously-skip-permissions "$triage_prompt" &
+        timeout "$((agent_timeout * num_agents))" claude --print --model opus --dangerously-skip-permissions "$triage_prompt" &
         triage_pid=$!
 
         shown_triage=""
@@ -590,11 +744,15 @@ Spawn triage agents in parallel. When complete, produce a FINAL SUMMARY showing:
                     fi
                 fi
             done
-            sleep 3
+            show_spinner "Waiting for triage..."
+            sleep 2
         done
+        printf "\r                                        \n"
         wait $triage_pid || true
     else
-        claude --print --model opus --dangerously-skip-permissions "$triage_prompt"
+        timeout "$((agent_timeout * num_agents))" claude --print --model opus --dangerously-skip-permissions "$triage_prompt" || {
+            echo "⚠️  Triage phase timed out"
+        }
     fi
 fi
 
@@ -608,10 +766,23 @@ if [[ "$use_history" == true ]]; then
     echo "📜 Updated history: $(wc -l < "$history_file") files tracked"
 fi
 
+# ============================================================
+# Summary
+# ============================================================
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "✅ flashmob v4 complete"
+echo "✅ flashmob v5 complete"
 echo "   Reports: reports/gemini-flashmob-*.json"
+
+# Count total issues
+total_issues=0
+for report in reports/gemini-flashmob-*.json; do
+    [[ ! -f "$report" ]] && continue
+    count=$(jq 'if type == "array" then length else 0 end' "$report" 2>/dev/null || echo 0)
+    total_issues=$((total_issues + count))
+done
+echo "   Total issues: $total_issues"
+
 if [[ "$do_triage" == true ]]; then
     echo "   Triage:  reports/triage-*.json"
 fi
